@@ -1,0 +1,226 @@
+Main code
+___________
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <time.h>
+#include <errno.h>
+#include <math.h>
+#include "rpi_gpio.h"
+
+#define LED_PIN             GPIO17
+#define SERVO_PIN           GPIO18
+#define TRIG_PIN            GPIO23
+#define ECHO_PIN            GPIO24
+
+#define TOTAL_CYCLES        50
+#define SENSOR_TIMEOUT_NS   30000000LL
+#define LED_HALF_PERIOD_US  500000
+
+static int64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static void delay_us(long us)
+{
+    struct timespec req;
+
+    req.tv_sec = us / 1000000L;
+    req.tv_nsec = (us % 1000000L) * 1000L;
+
+    while (nanosleep(&req, &req) == -1 && errno == EINTR) {
+    }
+}
+
+static int write_pin(int pin, unsigned level)
+{
+    return rpi_gpio_output(pin, level);
+}
+
+static double ultrasonic_distance_cm(void)
+{
+    unsigned level;
+    int64_t start;
+    int64_t pulse_start;
+    int64_t pulse_end;
+
+    write_pin(TRIG_PIN, GPIO_LOW);
+    delay_us(2);
+    write_pin(TRIG_PIN, GPIO_HIGH);
+    delay_us(10);
+    write_pin(TRIG_PIN, GPIO_LOW);
+
+    start = now_ns();
+
+    while (1) {
+        if (rpi_gpio_input(ECHO_PIN, &level) != 0)
+            return -1.0;
+
+        if (level == GPIO_HIGH)
+            break;
+
+        if (now_ns() - start > SENSOR_TIMEOUT_NS)
+            return -1.0;
+    }
+
+    pulse_start = now_ns();
+
+    while (1) {
+        if (rpi_gpio_input(ECHO_PIN, &level) != 0)
+            return -1.0;
+
+        if (level == GPIO_LOW)
+            break;
+
+        if (now_ns() - pulse_start > SENSOR_TIMEOUT_NS)
+            return -1.0;
+    }
+
+    pulse_end = now_ns();
+
+    return ((double)(pulse_end - pulse_start) / 1000.0)
+           * 0.0343 / 2.0;
+}
+
+static int servo_set_angle(int angle)
+{
+    float duty;
+
+    if (angle < 0)
+        angle = 0;
+
+    if (angle > 180)
+        angle = 180;
+
+    duty = 2.5f + (10.0f * angle / 180.0f);
+
+    return rpi_gpio_set_pwm_duty_cycle(SERVO_PIN, duty);
+}
+
+int main(void)
+{
+    int cycle;
+    int angle = 0;
+    int direction = 1;
+    int led_on = 0;
+
+    int64_t cycle_start;
+    int64_t cycle_end;
+    int64_t led_start;
+    int64_t led_end;
+
+    double distance;
+    double latency_ms;
+    double jitter_ms;
+    double execution_ms;
+    double previous_execution_ms = 0.0;
+
+    const char *led_state;
+
+    printf("\n");
+    printf("===============================================================\n");
+    printf("             AUTOMOTIVE RTOS PERFORMANCE ANALYZER\n");
+    printf("===============================================================\n");
+    printf("Trial | Distance(cm) | Servo(deg) | LED | Latency(ms) | Jitter(ms) | Execution(ms)\n");
+    printf("-------------------------------------------------------------------------------\n");
+
+    if (rpi_gpio_setup(LED_PIN, GPIO_OUT) != 0 ||
+        rpi_gpio_setup(TRIG_PIN, GPIO_OUT) != 0 ||
+        rpi_gpio_setup(ECHO_PIN, GPIO_IN) != 0) {
+        printf("GPIO initialization failed.\n");
+        rpi_gpio_cleanup();
+        return EXIT_FAILURE;
+    }
+
+    if (rpi_gpio_setup_pwm(SERVO_PIN, 50, GPIO_PWM_MODE_MS) != 0) {
+        printf("Servo PWM initialization failed.\n");
+        rpi_gpio_cleanup();
+        return EXIT_FAILURE;
+    }
+
+    write_pin(LED_PIN, GPIO_LOW);
+    write_pin(TRIG_PIN, GPIO_LOW);
+
+    for (cycle = 1; cycle <= TOTAL_CYCLES; cycle++) {
+        cycle_start = now_ns();
+
+        distance = ultrasonic_distance_cm();
+
+        if (servo_set_angle(angle) != 0)
+            printf("Servo positioning failed.\n");
+
+        led_start = now_ns();
+
+        if (led_on == 0) {
+            if (write_pin(LED_PIN, GPIO_HIGH) != 0)
+                printf("Unable to switch LED on.\n");
+
+            led_on = 1;
+            led_state = "ON";
+        } else {
+            if (write_pin(LED_PIN, GPIO_LOW) != 0)
+                printf("Unable to switch LED off.\n");
+
+            led_on = 0;
+            led_state = "OFF";
+        }
+
+        led_end = now_ns();
+
+        latency_ms = (double)(led_end - led_start) / 1000000.0;
+
+        delay_us(LED_HALF_PERIOD_US);
+
+        cycle_end = now_ns();
+
+        execution_ms =
+            (double)(cycle_end - cycle_start) / 1000000.0;
+
+        if (cycle == 1)
+            jitter_ms = 0.0;
+        else
+            jitter_ms = fabs(execution_ms - previous_execution_ms);
+
+        previous_execution_ms = execution_ms;
+
+        if (distance >= 0.0) {
+            printf("%5d | %12.2f | %10d | %3s | %11.4f | %10.4f | %13.3f\n",
+                   cycle, distance, angle, led_state,
+                   latency_ms, jitter_ms, execution_ms);
+        } else {
+            printf("%5d | %12s | %10d | %3s | %11.4f | %10.4f | %13.3f\n",
+                   cycle, "TIMEOUT", angle, led_state,
+                   latency_ms, jitter_ms, execution_ms);
+        }
+
+        angle += direction * 30;
+
+        if (angle >= 180) {
+            angle = 180;
+            direction = -1;
+        } else if (angle <= 0) {
+            angle = 0;
+            direction = 1;
+        }
+
+        delay_us(100000);
+    }
+
+    write_pin(LED_PIN, GPIO_LOW);
+    write_pin(TRIG_PIN, GPIO_LOW);
+    servo_set_angle(0);
+
+    rpi_gpio_cleanup();
+
+    printf("-------------------------------------------------------------------------------\n");
+    printf("Test finished: %d iterations executed.\n", TOTAL_CYCLES);
+    printf("GPIO resources released successfully.\n");
+
+    return EXIT_SUCCESS;
+}
+
